@@ -1,6 +1,5 @@
 import pytest
-from datetime import date
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from fastapi.testclient import TestClient
 from app.main import app
 
@@ -13,17 +12,11 @@ def test_root_health_check():
     assert data["status"] == "healthy"
     assert "Smart Waste Management" in data["system"]
 
-@patch("app.api.v1.endpoints.auth.get_db_connection")
+@patch("app.api.v1.endpoints.auth.execute_query")
 @patch("app.api.v1.endpoints.auth.verify_password")
-def test_login_success(mock_verify, mock_get_db):
+def test_login_success(mock_verify, mock_execute):
     mock_verify.return_value = True
-    
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_get_db.return_value = mock_conn
-    mock_conn.cursor.return_value = mock_cursor
-
-    mock_cursor.fetchone.return_value = {
+    mock_execute.return_value = {
         "id": 1,
         "username": "admin",
         "email": "admin@metro.gov.in",
@@ -40,13 +33,9 @@ def test_login_success(mock_verify, mock_get_db):
     assert data["user"]["username"] == "admin"
     assert data["user"]["role"] == "Admin"
 
-@patch("app.api.v1.endpoints.auth.get_db_connection")
-def test_login_invalid_credentials(mock_get_db):
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_get_db.return_value = mock_conn
-    mock_conn.cursor.return_value = mock_cursor
-    mock_cursor.fetchone.return_value = None
+@patch("app.api.v1.endpoints.auth.execute_query")
+def test_login_invalid_credentials(mock_execute):
+    mock_execute.return_value = None
 
     response = client.post("/api/v1/auth/login", json={"username": "invalid_user", "password": "wrong_password"})
     assert response.status_code == 401
@@ -61,7 +50,6 @@ def test_forecasting_pipeline_mock(mock_fetch):
     import pandas as pd
     import numpy as np
 
-    # Mock 100 days of daily historical collection data
     dates = pd.date_range(start="2024-01-01", periods=100, freq="D")
     weights = np.random.normal(loc=5000, scale=300, size=100)
     mock_df = pd.DataFrame({"date": dates, "weight_kg": weights})

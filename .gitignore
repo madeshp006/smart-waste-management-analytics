@@ -20,8 +20,10 @@ frontend/.cache/
 
 # Database data & logs
 pgdata/
+pg_local_data/
 *.log
 *.sqlite3
+*.db
 
 # Environment variables
 .env

@@ -5,40 +5,32 @@ from typing import Dict, Any, List, Optional
 import pandas as pd
 import numpy as np
 
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error
-import psycopg2
+from app.db.connection import get_db
 
 logging.basicConfig(level=logging.INFO)
 
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("POSTGRES_DB", "waste_dw_db")
-DB_USER = os.getenv("POSTGRES_USER", "waste_user")
-DB_PASS = os.getenv("POSTGRES_PASSWORD", "waste_password")
-
-def get_db_connection():
-    return psycopg2.connect(
-        host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASS
-    )
-
 def fetch_daily_time_series(ward_id: Optional[int] = None) -> pd.DataFrame:
-    """Fetches daily aggregated waste collection history from DW Star Schema."""
-    conn = get_db_connection()
+    conn, engine_type = get_db()
     
     where_clause = ""
     params = []
     if ward_id:
-        where_clause = "WHERE w.ward_id = %s"
+        where_clause = "WHERE w.ward_id = %s" if engine_type == "postgres" else "WHERE w.ward_id = ?"
         params.append(ward_id)
+
+    fact_table = "dw.fact_waste_generation" if engine_type == "postgres" else "fact_waste_generation"
+    dim_date = "dw.dim_date" if engine_type == "postgres" else "dim_date"
+    dim_ward = "dw.dim_ward" if engine_type == "postgres" else "dim_ward"
 
     query = f"""
         SELECT 
             d.full_date as date,
             SUM(f.weight_kg) as weight_kg
-        FROM dw.fact_waste_generation f
-        JOIN dw.dim_date d ON f.date_key = d.date_key
-        JOIN dw.dim_ward w ON f.ward_key = w.ward_key
+        FROM {fact_table} f
+        JOIN {dim_date} d ON f.date_key = d.date_key
+        JOIN {dim_ward} w ON f.ward_key = w.ward_key
         {where_clause}
         GROUP BY d.full_date
         ORDER BY d.full_date ASC;
@@ -48,19 +40,19 @@ def fetch_daily_time_series(ward_id: Optional[int] = None) -> pd.DataFrame:
     conn.close()
 
     if df.empty:
-        # Fallback query from public schema if dw is empty
-        conn = get_db_connection()
+        conn, engine_type = get_db()
+        rec_table = "public.waste_collection_records" if engine_type == "postgres" else "waste_collection_records"
         where_clause_oltp = ""
         params_oltp = []
         if ward_id:
-            where_clause_oltp = "WHERE ward_id = %s"
+            where_clause_oltp = "WHERE ward_id = %s" if engine_type == "postgres" else "WHERE ward_id = ?"
             params_oltp.append(ward_id)
 
         query_oltp = f"""
             SELECT 
                 collection_date as date,
                 SUM(weight_kg) as weight_kg
-            FROM public.waste_collection_records
+            FROM {rec_table}
             {where_clause_oltp}
             GROUP BY collection_date
             ORDER BY collection_date ASC;
@@ -73,7 +65,6 @@ def fetch_daily_time_series(ward_id: Optional[int] = None) -> pd.DataFrame:
     return df
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Creates temporal, calendar, lag, and rolling statistics features."""
     data = df.copy()
     data["day_of_week"] = data["date"].dt.dayofweek
     data["day_of_month"] = data["date"].dt.day
@@ -81,7 +72,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     data["is_weekend"] = data["day_of_week"].isin([5, 6]).astype(int)
     data["day_of_year"] = data["date"].dt.dayofyear
 
-    # Lag features
     data["lag_1"] = data["weight_kg"].shift(1)
     data["lag_7"] = data["weight_kg"].shift(7)
     data["lag_14"] = data["weight_kg"].shift(14)
@@ -93,10 +83,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return data
 
 def train_and_forecast(ward_id: Optional[int] = None, horizon_days: int = 30) -> Dict[str, Any]:
-    """
-    Trains ML model on historical waste time series and projects future waste generation
-    with 95% confidence prediction intervals.
-    """
     df_raw = fetch_daily_time_series(ward_id)
     if len(df_raw) < 60:
         raise ValueError(f"Insufficient historical data ({len(df_raw)} records) for ML training. Need at least 60 days.")
@@ -109,7 +95,6 @@ def train_and_forecast(ward_id: Optional[int] = None, horizon_days: int = 30) ->
     ]
     target_col = "weight_kg"
 
-    # Train / Test split (Last 45 days as test evaluation set)
     split_idx = max(len(df_feats) - 45, int(len(df_feats) * 0.8))
     train_df = df_feats.iloc[:split_idx]
     test_df = df_feats.iloc[split_idx:]
@@ -117,37 +102,25 @@ def train_and_forecast(ward_id: Optional[int] = None, horizon_days: int = 30) ->
     X_train, y_train = train_df[feature_cols], train_df[target_col]
     X_test, y_test = test_df[feature_cols], test_df[target_col]
 
-    # Model training (RandomForest Ensemble)
     model = RandomForestRegressor(n_estimators=100, max_depth=12, random_state=42)
     model.fit(X_train, y_train)
 
-    # Evaluate on test set
     test_preds = model.predict(X_test)
     mae = mean_absolute_error(y_test, test_preds)
     rmse = np.sqrt(mean_squared_error(y_test, test_preds))
     mape = mean_absolute_percentage_error(y_test, test_preds) * 100.0
 
-    # Residual standard deviation for 95% confidence interval estimation
     residuals = y_test - test_preds
     std_residual = np.std(residuals)
 
-    # Refit model on full feature set
     model.fit(df_feats[feature_cols], df_feats[target_col])
 
-    # Iterative multi-step forecasting into future horizon
     last_known_date = df_raw["date"].max()
-    history_weights = list(df_raw["weight_kg"].values)
-    history_dates = list(df_raw["date"].values)
-
     future_predictions = []
-    
     current_date = last_known_date + timedelta(days=1)
-    
-    # Copy full series to compute rolling/lags iteratively
     full_weights = list(df_raw["weight_kg"].values)
 
     for i in range(horizon_days):
-        # Construct feature row for step
         dow = current_date.weekday()
         dom = current_date.day
         month = current_date.month
@@ -170,7 +143,6 @@ def train_and_forecast(ward_id: Optional[int] = None, horizon_days: int = 30) ->
         pred_val = float(model.predict(feat_vector)[0])
         pred_val = max(100.0, pred_val)
 
-        # 95% Confidence Interval (z = 1.96) growing slightly over time
         uncertainty = 1.96 * std_residual * np.sqrt(1 + (i * 0.02))
         lower_bound = max(0.0, pred_val - uncertainty)
         upper_bound = pred_val + uncertainty
@@ -185,7 +157,6 @@ def train_and_forecast(ward_id: Optional[int] = None, horizon_days: int = 30) ->
         full_weights.append(pred_val)
         current_date += timedelta(days=1)
 
-    # Format historical tail (last 60 days) for chart overlay
     hist_tail = df_raw.tail(60)
     historical_out = [
         {

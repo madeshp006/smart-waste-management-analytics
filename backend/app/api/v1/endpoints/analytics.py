@@ -1,13 +1,10 @@
 from typing import Optional, List
 from datetime import date, timedelta
 from fastapi import APIRouter, Depends, Query
-import psycopg2
-import psycopg2.extras
-from app.core.security import get_current_user, get_db_connection
+from app.core.security import get_current_user
+from app.db.connection import get_db, execute_query
 from app.etl import olap_queries
-from app.schemas.schemas import (
-    DashboardKPIs, WasteTrendItem, WasteCompositionItem, WardPerformanceItem
-)
+from app.schemas.schemas import DashboardKPIs, WasteTrendItem, WasteCompositionItem, WardPerformanceItem
 
 router = APIRouter()
 
@@ -22,51 +19,46 @@ def get_dashboard_kpis(
     if not start_date:
         start_date = end_date - timedelta(days=30)
 
-    conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    conn, engine_type = get_db()
+    rec_table = "public.waste_collection_records" if engine_type == "postgres" else "waste_collection_records"
+    wards_table = "public.wards" if engine_type == "postgres" else "wards"
+    fact_table = "dw.fact_waste_generation" if engine_type == "postgres" else "fact_waste_generation"
+    dim_date = "dw.dim_date" if engine_type == "postgres" else "dim_date"
 
-    # 1. Total waste collected & avg per day
-    cursor.execute("""
+    kpi_sql = f"""
         SELECT 
             COALESCE(SUM(weight_kg), 0) as total_kg,
-            COALESCE(AVG(weight_kg), 0) as avg_kg,
             COUNT(DISTINCT collection_date) as active_days
-        FROM public.waste_collection_records
+        FROM {rec_table}
         WHERE collection_date >= %s AND collection_date <= %s;
-    """, (start_date, end_date))
-    kpi_raw = cursor.fetchone()
+    """
+    kpi_raw = execute_query(kpi_sql, (str(start_date), str(end_date)), fetch="one")
 
-    # 2. Ward count
-    cursor.execute("SELECT COUNT(*) as cnt FROM public.wards;")
-    ward_cnt = cursor.fetchone()["cnt"]
+    ward_cnt_row = execute_query(f"SELECT COUNT(*) as cnt FROM {wards_table};", fetch="one")
+    ward_cnt = ward_cnt_row["cnt"] if ward_cnt_row else 15
 
-    # 3. Highest waste ward
-    cursor.execute("""
+    top_ward_sql = f"""
         SELECT w.name, SUM(r.weight_kg) as total_kg
-        FROM public.waste_collection_records r
-        JOIN public.wards w ON r.ward_id = w.id
+        FROM {rec_table} r
+        JOIN {wards_table} w ON r.ward_id = w.id
         WHERE r.collection_date >= %s AND r.collection_date <= %s
         GROUP BY w.name
         ORDER BY total_kg DESC LIMIT 1;
-    """, (start_date, end_date))
-    top_ward = cursor.fetchone()
+    """
+    top_ward = execute_query(top_ward_sql, (str(start_date), str(end_date)), fetch="one")
     top_ward_name = top_ward["name"] if top_ward else "N/A"
 
-    # 4. Avg per capita waste g
-    cursor.execute("""
+    per_capita_sql = f"""
         SELECT AVG(per_capita_waste_g) as avg_g
-        FROM dw.fact_waste_generation f
-        JOIN dw.dim_date d ON f.date_key = d.date_key
+        FROM {fact_table} f
+        JOIN {dim_date} d ON f.date_key = d.date_key
         WHERE d.full_date >= %s AND d.full_date <= %s;
-    """, (start_date, end_date))
-    per_capita_row = cursor.fetchone()
+    """
+    per_capita_row = execute_query(per_capita_sql, (str(start_date), str(end_date)), fetch="one")
     avg_per_capita = float(per_capita_row["avg_g"]) if per_capita_row and per_capita_row["avg_g"] else 485.5
 
-    cursor.close()
-    conn.close()
-
-    total_kg = float(kpi_raw["total_kg"])
-    active_days = max(1, kpi_raw["active_days"])
+    total_kg = float(kpi_raw["total_kg"]) if kpi_raw else 0.0
+    active_days = max(1, kpi_raw["active_days"] if kpi_raw else 1)
 
     return {
         "total_waste_collected_kg": round(total_kg, 2),

@@ -1,25 +1,23 @@
 from fastapi import APIRouter, HTTPException, status, Depends
-import psycopg2
-import psycopg2.extras
-from app.core.security import verify_password, create_access_token, get_current_user, get_db_connection
+from app.core.security import verify_password, create_access_token, get_current_user
+from app.db.connection import get_db, execute_query
 from app.schemas.schemas import LoginRequest, TokenResponse, UserOut
 
 router = APIRouter()
 
 @router.post("/login", response_model=TokenResponse)
 def login(request: LoginRequest):
-    conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    
-    cursor.execute("""
+    conn, engine_type = get_db()
+    users_table = "public.users" if engine_type == "postgres" else "users"
+    wards_table = "public.wards" if engine_type == "postgres" else "wards"
+
+    sql = f"""
         SELECT u.id, u.username, u.email, u.hashed_password, u.role, u.ward_id, w.name as ward_name
-        FROM public.users u
-        LEFT JOIN public.wards w ON u.ward_id = w.id
+        FROM {users_table} u
+        LEFT JOIN {wards_table} w ON u.ward_id = w.id
         WHERE u.username = %s OR u.email = %s;
-    """, (request.username, request.username))
-    user = cursor.fetchone()
-    cursor.close()
-    conn.close()
+    """
+    user = execute_query(sql, (request.username, request.username), fetch="one")
 
     if not user or not verify_password(request.password, user["hashed_password"]):
         raise HTTPException(
